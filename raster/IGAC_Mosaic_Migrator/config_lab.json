@@ -1,0 +1,12 @@
+{
+  "server_url": "https://spwebgis113.esri.co/server",
+  "sde_connection": "C:\\Users\\superuser\\Documents\\ArcGIS\\Projects\\Servicios\\PostgreSQL-11326server,5432-raster(rasteruser).sde",
+  "manifest_match": {
+    "DATABASE": "raster",
+    "SERVER": "11326server"
+  },
+  "old_root": "\\\\11326webgis\\ArcGIS\\cemdatos\\Raster",
+  "new_root": "\\\\11326server\\ArcGIS\\cemdatos\\Raster",
+  "output_dir": "resultados_mosaicos",
+  "ca_bundle": null
+}
