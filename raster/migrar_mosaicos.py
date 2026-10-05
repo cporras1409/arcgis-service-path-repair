@@ -1,4 +1,5 @@
 """Inventario y reparación por lotes de mosaicos publicados en ArcGIS Server."""
+
 import argparse
 import csv
 import getpass
