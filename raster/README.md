@@ -1,106 +1,386 @@
-# Actualización masiva de rutas de mosaicos
+# IGAC — Migración de rutas de mosaicos raster
 
-## Alcance
+## 1. Objetivo
 
-Recorre la raíz y las carpetas de un sitio ArcGIS Server, excepto System y Utilities. Identifica los mosaicos referenciados por ImageServer mediante el manifiesto administrativo, verifica que sean MosaicDataset en la conexión SDE configurada y actualiza cada mosaico una sola vez. Incluye MapServer del mismo sitio que referencien ese mosaico en el grupo de parada e inicio. Otros tipos de servicio se reportan sin cambios.
+Herramientas para identificar y actualizar rutas de archivos raster utilizadas por **Mosaic Datasets publicados en ArcGIS Server**.
 
-Este paquete está configurado para el laboratorio spwebgis113. No se ha ejecutado desde este entorno contra el servidor ni con ArcPy. La reparación individual ya fue validada por el operador; la detección masiva y el control de servicios necesitan su prueba de integración.
+El proceso trabaja sobre mosaicos almacenados en una **Enterprise Geodatabase** accesible mediante una conexión `.sde`, identifica sus servicios asociados y reemplaza las rutas de los archivos raster desde `old_root` hacia `new_root`.
 
-## Requisitos
+No republica servicios ni modifica la conexión SDE del servicio.
 
-- Windows y entorno Python de ArcGIS Pro con ArcPy, requests y licencia Standard o Advanced.
-- Conexión SDE con permisos sobre los mosaicos, preferiblemente su propietario.
-- Cuenta administradora del sitio para /admin; usuario y contraseña se solicitan sin guardarlos.
-- El Web Adaptor debe permitir acceso administrativo; alternativamente use la URL HTTPS directa del sitio en server_url.
-- Esta versión usa generateToken de ArcGIS Server, con cuenta del sitio. No implementa OAuth, SAML ni inicio de sesión de Portal.
-- Copia completa de imágenes y overviews al destino y permisos SMB/NTFS para la cuenta de ArcGIS Server, en todos los nodos.
-- Respaldo recuperable de la geodatabase y ventana sin edición/publicación concurrente.
+---
 
-## Configuración
+## 2. Archivos
 
-manifest_match compara valores EXACTOS del onServerConnectionString del manifiesto, sin distinguir mayúsculas. DATABASE=raster y SERVER=11326server son valores iniciales que deben validarse con el diagnóstico. Si el manifiesto utiliza FQDN, puerto u otro identificador, ajuste al valor real; puede usar INSTANCE en lugar de SERVER. La conexión SDE debe apuntar a esa misma base e instancia. No deduce coincidencias por nombres de servicio ni por sufijos de dataset.
+| Archivo | Uso |
+|---|---|
+| `migrar_mosaicos.py` | Script principal para inventario, diagnóstico y migración masiva de mosaicos. |
+| `migrar_mosaicos_filtrado.py` | Variante para trabajar directamente sobre un servicio específico y reducir el inventario durante pruebas controladas. |
+| `migrar_mosaicos_old.py` | Versión anterior conservada como referencia. No se recomienda para ejecución productiva. |
+| `config_lab.json` | Configuración del sitio, conexión SDE y rutas origen/destino. |
 
-Los ImageServer sin mosaico coincidente aparecen como SIN_MOSAICO_COINCIDENTE; deben revisarse antes de la ejecución masiva. Un inventario con errores de lectura bloquea --apply para no omitir dependencias conocidas. Los mosaicos de otras bases requieren otra configuración y conexión. No se modifican rutas de funciones ráster, caché del servicio, Registered Folders ni conexiones del servicio.
+### Script recomendado
 
-Si el certificado requiere una CA corporativa, indique la ruta PEM en ca_bundle. La verificación TLS permanece activa.
+Para ejecución normal y por lotes:
 
-## Ejecución
+```text
+migrar_mosaicos.py
+```
 
-Abra Python Command Prompt de ArcGIS Pro y cambie al directorio del paquete.
+Para pruebas sobre un único servicio:
 
-Diagnóstico de todo el sitio, sin detener servicios ni modificar mosaicos:
+```text
+migrar_mosaicos_filtrado.py
+```
+
+---
+
+## 3. Requisitos
+
+Ejecutar desde **Python Command Prompt de ArcGIS Pro**.
+
+Requiere:
+
+- ArcGIS Pro con ArcPy.
+- Python del entorno de ArcGIS Pro.
+- Paquete `requests`.
+- Conexión `.sde` con acceso a los Mosaic Dataset.
+- Cuenta administradora de ArcGIS Server.
+- Acceso al repositorio raster origen y destino.
+- Copia previa de las imágenes y overviews al nuevo repositorio.
+- Respaldo recuperable de la Enterprise Geodatabase antes de usar `--apply`.
+
+Instalar `requests` si es necesario (ArcGIS Pro 3.3.x ya lo trae instalado):
+
+```bat
+python -m pip install requests
+```
+
+---
+
+## 4. Configuración
+
+El archivo JSON debe contener como mínimo:
+
+```json
+{
+    "server_url": "https://servidor/arcgis",
+    "sde_connection": "C:\\ruta\\conexion.sde",
+    "old_root": "\\\\repositorio_anterior\\ArcGIS\\cemdatos",
+    "new_root": "\\\\repositorio_nuevo\\ArcGIS\\cemdatos",
+    "manifest_match": {
+        "DATABASE": "raster",
+        "SERVER": "servidor"
+    },
+    "output_dir": "resultados_mosaicos"
+}
+```
+
+`manifest_match` identifica únicamente los servicios cuya conexión del manifiesto corresponde a la Enterprise Geodatabase configurada.
+
+---
+
+## 5. Formatos soportados
+
+### Sí procesa
+
+| Servicio | Fuente del servicio | ¿Lo procesa? |
+|---|---|---|
+| ImageServer | Mosaic Dataset en Enterprise Geodatabase | Sí |
+| MapServer | Mosaic Dataset en la misma Enterprise Geodatabase | Sí, únicamente como servicio dependiente del mosaico |
+
+El script identifica el Mosaic Dataset a partir del manifiesto del servicio y verifica mediante ArcPy que el dataset corresponda al tipo:
+
+```text
+MosaicDataset
+```
+
+La actualización de las rutas se realiza mediante:
+
+```text
+arcpy.management.RepairMosaicDatasetPaths
+```
+
+**Nota:** Los archivos raster asociados al Mosaic Dataset deben haber sido copiados previamente al nuevo repositorio. El script no copia imágenes ni archivos raster; únicamente actualiza dentro del Mosaic Dataset las rutas que apuntan al repositorio anterior.
+
+### No procesa
+
+| Servicio / fuente | Motivo |
+|---|---|
+| ImageServer con Mosaic Dataset en FileGDB | El flujo actual trabaja con Mosaic Dataset almacenados en la Enterprise Geodatabase configurada mediante la conexión `.sde` |
+| ImageServer basado directamente en un Raster Dataset | No corresponde a un Mosaic Dataset |
+| ImageServer cuya Enterprise Geodatabase no coincide con `manifest_match` | Está fuera de la conexión configurada |
+| Datos raster copiados al servidor | No corresponden al patrón de Mosaic Dataset referenciado |
+| Hosted Services | No aplica |
+| FeatureServer | No aplica |
+| Servicios sin Mosaic Dataset identificable en el manifiesto | Se reportan como `SIN_MOSAICO_COINCIDENTE` |
+| Rutas que no estén bajo `old_root` | No se modifican |
+---
+
+## 6. Inventario IGAC identificado
+
+Según el inventario de servicios de Mapas 2:
+
+| Tipo de servicio | Fuente | Cantidad | ¿Este script lo migra? |
+|---|---|---:|---|
+| ImageServer | Enterprise Geodatabase PostgreSQL | 1.110 | Sí, si el dataset es Mosaic Dataset y coincide con la conexión configurada |
+| ImageServer | File Geodatabase | 2 | No |
+| MapServer | Enterprise Geodatabase PostgreSQL | 49 | Solo si referencia uno de los Mosaic Dataset identificados |
+| MapServer | FileGDB | 1.542 | No |
+| MapServer | Shapefile | 4 | No |
+| FeatureServer Hosted | ArcGIS Data Store | 15 | No |
+
+### Universo principal del proceso raster
+
+El universo principal corresponde a:
+
+```text
+1.110 ImageServer
+```
+
+con fuente registrada mediante Enterprise Geodatabase PostgreSQL.
+
+Sin embargo, un servicio solo entra al proceso cuando cumple todas estas condiciones:
+
+1. Es `ImageServer` o `MapServer`.
+2. La fuente está publicada **por referencia**.
+3. La conexión del manifiesto coincide con `manifest_match`.
+4. El dataset existe en la conexión `.sde`.
+5. ArcPy identifica el dataset como `MosaicDataset`.
+6. El grupo contiene al menos un `ImageServer`.
+7. Existen rutas bajo `old_root` que deban cambiar.
+8. Los archivos esperados en `new_root` existen antes de ejecutar la reparación.
+
+---
+
+## 7. Servicios que se migran
+
+Se migran los servicios cuyo manifiesto permita identificar un Mosaic Dataset válido en la Enterprise Geodatabase configurada.
+
+Ejemplo:
+
+```text
+ImageServer
+    ↓
+Enterprise GDB PostgreSQL
+    ↓
+Mosaic Dataset
+    ↓
+Raster físicos en recurso compartido
+```
+
+El cambio se realiza sobre las rutas internas del Mosaic Dataset:
+
+```text
+\\repositorio_anterior\...\imagen.tif
+```
+
+a:
+
+```text
+\\repositorio_nuevo\...\imagen.tif
+```
+
+El servicio no se republica.
+
+---
+
+## 8. Servicios que no se migran
+
+### ImageServer + FileGDB
+
+Cantidad identificada:
+
+```text
+2
+```
+
+No se procesan porque el script busca los Mosaic Dataset mediante la conexión `.sde` configurada.
+
+---
+
+### ImageServer sin Mosaic Dataset coincidente
+
+Estado:
+
+```text
+SIN_MOSAICO_COINCIDENTE
+```
+
+Puede ocurrir cuando:
+
+- la base no coincide con `manifest_match`;
+- el dataset no existe en la conexión SDE;
+- el dataset no es un Mosaic Dataset;
+- el manifiesto no contiene la referencia esperada.
+
+No se modifica.
+
+---
+
+### Servicio con error de inventario
+
+Estado:
+
+```text
+ERROR_INVENTARIO
+```
+
+En modo `--apply`, cualquier error de inventario bloquea la ejecución masiva para evitar modificar mosaicos con dependencias incompletas.
+
+---
+
+### Raster de destino inexistente
+
+Estado:
+
+```text
+BLOQUEADO_DESTINO
+```
+
+El script comprueba previamente que cada archivo raster esperado exista en `new_root`.
+
+Si falta alguno, el mosaico no se modifica.
+
+---
+
+### Mosaicos ya migrados
+
+Estado:
+
+```text
+SIN_CAMBIOS
+```
+
+Si el Mosaic Dataset ya utiliza las rutas nuevas, no se vuelve a modificar ni es necesario reiniciar sus servicios.
+
+---
+
+## 9. Uso
+
+### Inventario y diagnóstico
+
+No modifica datos ni detiene servicios:
 
 ```bat
 python migrar_mosaicos.py --config config_lab.json
 ```
 
-Prueba limitada al servicio conocido:
+---
+
+### Probar un solo servicio
+
+Con la versión filtrada:
 
 ```bat
-python migrar_mosaicos.py --config config_lab.json --service Raster/raster_rasteruser_orto10.ImageServer
-python migrar_mosaicos.py --config config_lab.json --service Raster/raster_rasteruser_orto10.ImageServer --apply --backup-confirmed
+python migrar_mosaicos_filtrado.py --config config_lab.json --service Raster/Servicio.ImageServer
 ```
 
-Si Orto10 ya está reparado, aparecerá SIN_CAMBIOS y no se reiniciará. Para una nueva prueba use un mosaico que conserve la ruta antigua o restablezca manualmente el mosaico de laboratorio.
+Aplicar el cambio:
 
-Primer lote de hasta diez mosaicos:
+```bat
+python migrar_mosaicos_filtrado.py --config config_lab.json --service Raster/Servicio.ImageServer --apply --backup-confirmed
+```
+
+---
+
+### Migrar los primeros 10 mosaicos
 
 ```bat
 python migrar_mosaicos.py --config config_lab.json --apply --backup-confirmed --limit 10
 ```
 
-Aplicar a todos los mosaicos identificados:
+`--limit 10` limita el procesamiento a los primeros diez mosaicos identificados.
+
+Los mosaicos que ya estén migrados aparecerán como:
+
+```text
+SIN_CAMBIOS
+```
+
+y no se vuelven a reparar.
+
+---
+
+### Migrar todos los mosaicos elegibles
 
 ```bat
 python migrar_mosaicos.py --config config_lab.json --apply --backup-confirmed
 ```
 
---limit selecciona los primeros N mosaicos del inventario, incluidos los que ya no necesitan cambios. Para continuar el conjunto completo, retire --limit; los ya reparados se omiten por sus rutas actuales. Cada invocación reconstruye el inventario.
+---
 
-## Procedimiento
+## 10. Validaciones realizadas
+
+Antes de modificar un mosaico, el script:
+
+1. Identifica el servicio mediante ArcGIS Server Admin.
+2. Consulta su `manifest.json`.
+3. Verifica que la fuente esté publicada por referencia.
+4. Compara la conexión con `manifest_match`.
+5. Verifica que el dataset exista mediante ArcPy.
+6. Verifica que sea un `MosaicDataset`.
+7. Exporta las rutas actuales.
+8. Calcula las rutas nuevas.
+9. Verifica que los archivos destino existan.
+10. Identifica todos los servicios que utilizan el mismo mosaico.
+
+Durante la aplicación:
+
+1. Guarda el estado inicial de los servicios.
+2. Detiene los servicios activos.
+3. Ejecuta `RepairMosaicDatasetPaths`.
+4. Exporta nuevamente las rutas.
+5. Compara el resultado con el reemplazo esperado.
+6. Restablece los servicios que estaban activos.
+
+---
+
+## 11. Resultados
+
+Cada ejecución genera una carpeta con:
 
 ```text
-Leer configuración y autenticar en el sitio
-Recorrer servicios de todas las carpetas de usuario
-    Consultar manifiesto para ImageServer y MapServer
-    Comparar base e instancia con la conexión configurada
-    Identificar MosaicDataset por nombre exacto
-Agrupar servicios por mosaico
-Conservar grupos que incluyan ImageServer
-Para cada mosaico seleccionado
-    Exportar todas las rutas (imágenes, overviews y caché de elementos)
-    Calcular reemplazos respetando límites de carpetas
-    Comprobar existencia de todos los archivos de destino afectados
-    Si es diagnóstico: registrar y seguir
-    Si no hay cambios: omitir
-    Si faltan archivos: bloquear ese mosaico y seguir
-    Guardar estados originales de todos sus servicios
-    Detener servicios activos y esperar confirmación
-    Reparar rutas
-    Exportar rutas finales y compararlas con las esperadas
-    Si son correctas: restaurar servicios originalmente activos
-    Si la reparación falla: mantener detenidos y detener lote
-    Guardar resultado
-Emitir resumen CSV y diarios JSON
+inventario.json
+plan.json
+resultados.json
+resumen.csv
+mosaico_N.json
+auditoria.gdb
 ```
 
-## Resultados y recuperación
+`auditoria.gdb` contiene las rutas encontradas antes y después de cada reparación.
 
-Cada ejecución crea una carpeta fechada con inventario.json, plan.json, resultados.json, resumen.csv, diarios mosaico_N.json y auditoria.gdb. Esta última contiene tablas de rutas antes y después. Los diarios se guardan antes de detener servicios y antes de modificar datos.
+Estados principales:
 
-La exportación de rutas es evidencia, no un respaldo de la geodatabase. No hay rollback automático: invertir la raíz podría modificar rutas de destino que ya existían antes. En REVISION_REQUERIDA, revise las tablas y el respaldo y repare/restaure con el administrador SIG antes de arrancar servicios. Los estados originales están en el diario.
+| Estado | Significado |
+|---|---|
+| `ACTUALIZADO` | Rutas actualizadas correctamente |
+| `SIN_CAMBIOS` | El mosaico no tiene rutas pendientes |
+| `BLOQUEADO_DESTINO` | Faltan archivos en el nuevo repositorio |
+| `SIN_MOSAICO_COINCIDENTE` | Servicio fuera del patrón soportado |
+| `ERROR_INVENTARIO` | No fue posible determinar correctamente la fuente |
+| `REVISION_REQUERIDA` | La reparación inició pero no pudo validarse completamente |
+| `ERROR_REINICIO` | Error al restaurar el estado de uno o más servicios |
+| `ERROR_ANTES_CAMBIO` | Fallo antes de ejecutar la modificación |
 
-Si falla únicamente la parada, el script intenta restaurar los servicios originalmente activos. Si el proceso se termina abruptamente o se apaga la máquina, la restauración no está garantizada: consulte el diario y restablezca los estados manualmente. No existe transacción global para los 1.027 mosaicos.
+---
 
-## Validación de aceptación
+## 12. Consideración importante
 
-El script comprueba archivos desde la cuenta ejecutora, compara rutas completas antes/después y confirma configuredState/realTimeState de servicios. No realiza exportImage ni certifica la lectura desde la cuenta de ArcGIS Server. Después de cada lote, probar visualización a escalas generales y de detalle, revisar overviews y logs del servidor. Rutas ya rotas fuera de la raíz elegida no se corrigen con esta operación.
+El script **no realiza rollback automático del Mosaic Dataset**.
 
-El inventario de dependencias se limita al sitio configurado y a sus ImageServer/MapServer. Si otros sitios, aplicaciones o procesos consumen los mismos mosaicos, deben coordinarse dentro de la ventana. El programa no modifica la definición del servicio ni republica.
+Antes de ejecutar:
 
-## Referencias
+```text
+--apply --backup-confirmed
+```
 
-- https://pro.arcgis.com/en/pro-app/3.4/tool-reference/data-management/repair-mosaic-dataset-paths.htm
-- https://pro.arcgis.com/en/pro-app/3.4/tool-reference/data-management/export-mosaic-dataset-paths.htm
-- https://developers.arcgis.com/rest/enterprise-administration/server/servicemanifest/
-- https://developers.arcgis.com/rest/enterprise-administration/server/service-status/
+debe existir un respaldo recuperable de la Enterprise Geodatabase.
+
+Después de cada lote se debe validar al menos:
+
+- visualización del Image Service;
+- imágenes a escalas de detalle;
+- overviews;
+- logs de ArcGIS Server.

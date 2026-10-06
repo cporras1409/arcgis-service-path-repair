@@ -1,0 +1,13 @@
+{
+  "server_url": "https://mapas2.igac.gov.co/image2",
+  "sde_connection": "C:\\Users\\CPORRAS\\Documents\\ArcGIS\\Projects\\IGAC\\PostgreSQL-172-mapas2db(rasteruser).sde",
+  "manifest_match": {
+    "DATABASE": "mapas2db",
+    "SERVER": "172.19.1.61"
+  },
+  "old_root": "\\\\172.26.0.20\\cemdatos\\Raster",
+  "new_root": "\\\\repositorio\\ArcGIS\\cemdatos\\Raster",
+  "output_dir": "D:\\Consultoria\\IGAC\\scripts_migrate_paths\\arcgis-service-path-repair\\raster",
+  "ca_bundle": null
+}
+

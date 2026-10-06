@@ -1,4 +1,4 @@
-"""Inventario y reparación por lotes de mosaicos publicados en ArcGIS Server."""
+"""Inventario y reparación incremental de mosaicos publicados en ArcGIS Server.\n\nOmite mosaicos ya migrados y aplica --limit únicamente a los pendientes.\n"""
 
 import argparse
 import csv
@@ -48,7 +48,11 @@ class Server:
         if 'token' not in data:
             raise RuntimeError('No se pudo autenticar con Server Admin. Use una cuenta del sitio.')
         self.token = data['token']
-        self.expires = data.get('expires', (time.time() + 3000) * 1000) / 1000
+        expires = data.get('expires')
+        try:
+            self.expires = int(expires) / 1000
+        except (TypeError, ValueError):
+            self.expires = time.time() + 3000
 
     def call(self, path, parameters=None, post=False):
         for attempt in range(2):
@@ -98,9 +102,11 @@ class Server:
                 yield (folder + '/' if folder else '') + item['serviceName'] + '.' + item['type']
 
 
-def inventory(server, config):
+def inventory(server, config, only_service=None):
     groups, rows, failures = {}, [], []
     for service in server.services():
+        if only_service and service.casefold() != only_service.casefold():
+            continue
         print('Inventario:', service, flush=True)
         if not service.endswith(('.ImageServer', '.MapServer')):
             rows.append({'servicio': service, 'estado': 'TIPO_NO_APLICA'})
@@ -152,6 +158,75 @@ def export_paths(mosaic, gdb, name):
         return [str(row[0]) for row in cursor if row[0]]
 
 
+def path_under_root(path, root):
+    path = ntpath.normcase(ntpath.normpath(path))
+    root = ntpath.normcase(ntpath.normpath(root))
+    return path == root or path.startswith(root + '\\')
+
+
+def classify_group(config, group, gdb, index):
+    """
+    Clasifica el mosaico ANTES de aplicar --limit.
+
+    PENDIENTE:
+        Tiene al menos una ruta bajo OLD_ROOT.
+    ALREADY_MIGRATED:
+        No tiene OLD_ROOT y sí tiene rutas bajo NEW_ROOT.
+    SIN_CAMBIO_APLICABLE:
+        No tiene rutas ni bajo OLD_ROOT ni bajo NEW_ROOT.
+
+    Un mosaico parcialmente migrado (rutas OLD + NEW) sigue siendo PENDIENTE,
+    pero RepairMosaicDatasetPaths solo transformará las rutas que comiencen
+    por OLD_ROOT.
+    """
+    old = config['old_root']
+    new = config['new_root']
+    paths = export_paths(
+        group['mosaico'],
+        gdb,
+        f'c{index}_clasificacion'
+    )
+
+    normalized = sorted({
+        ntpath.normpath(path)
+        for path in paths
+        if path
+    }, key=str.casefold)
+
+    old_paths = [
+        path for path in normalized
+        if path_under_root(path, old)
+    ]
+    new_paths = [
+        path for path in normalized
+        if path_under_root(path, new)
+    ]
+    other_paths = [
+        path for path in normalized
+        if not path_under_root(path, old)
+        and not path_under_root(path, new)
+    ]
+
+    if old_paths:
+        status = 'PENDIENTE'
+    elif new_paths:
+        status = 'ALREADY_MIGRATED'
+    else:
+        status = 'SIN_CAMBIO_APLICABLE'
+
+    return {
+        **group,
+        'clasificacion': status,
+        'total_rutas': len(normalized),
+        'rutas_old_root': len(old_paths),
+        'rutas_new_root': len(new_paths),
+        'rutas_otras': len(other_paths),
+        'old_paths': old_paths,
+        'new_paths': new_paths,
+        'other_paths': other_paths,
+    }
+
+
 def process(server, config, group, gdb, index, apply, journal):
     result = {**group, 'estado': 'DIAGNOSTICO', 'estados_originales': {}}
     prefix = 'm' + str(index)
@@ -162,7 +237,7 @@ def process(server, config, group, gdb, index, apply, journal):
     result['destinos_no_accesibles'] = [new_path for _, new_path in changes if not os.path.isfile(new_path)]
     save(journal, result)
     if not changes:
-        result['estado'] = 'SIN_CAMBIOS'
+        result['estado'] = 'ALREADY_MIGRATED'
     elif result['destinos_no_accesibles']:
         result['estado'] = 'BLOQUEADO_DESTINO'
     elif apply:
@@ -236,15 +311,99 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     gdb = arcpy.management.CreateFileGDB(str(out), 'auditoria.gdb').getOutput(0)
     server = Server(config)
-    groups, rows, failures = inventory(server, config)
+    groups, rows, failures = inventory(
+        server,
+        config,
+        only_service=args.service
+    )
     save(out / 'inventario.json', rows)
     if failures and args.apply:
         raise RuntimeError('Inventario incompleto; no se aplicaron cambios. Revise inventario.json')
-    if args.service:
-        groups = [g for g in groups if args.service in g['servicios']]
+
+    print('Clasificando mosaicos por estado de migración...', flush=True)
+    classification = []
+    classification_failures = []
+
+    for class_index, group in enumerate(groups, 1):
+        try:
+            item = classify_group(
+                config,
+                group,
+                gdb,
+                class_index
+            )
+            classification.append(item)
+            print(
+                f"  {item['clasificacion']}: {item['mosaico']} "
+                f"(OLD={item['rutas_old_root']}, "
+                f"NEW={item['rutas_new_root']}, "
+                f"OTRAS={item['rutas_otras']})",
+                flush=True
+            )
+        except Exception as exc:
+            failed = {
+                **group,
+                'clasificacion': 'ERROR_CLASIFICACION',
+                'error': str(exc)
+            }
+            classification.append(failed)
+            classification_failures.append(failed)
+            print(
+                '  ERROR_CLASIFICACION: '
+                + group['mosaico']
+                + ' -> '
+                + str(exc),
+                flush=True
+            )
+
+    save(out / 'clasificacion.json', classification)
+
+    if classification_failures and args.apply:
+        raise RuntimeError(
+            'Clasificación incompleta; no se aplicaron cambios. '
+            'Revise clasificacion.json'
+        )
+
+    already_migrated = [
+        item for item in classification
+        if item.get('clasificacion') == 'ALREADY_MIGRATED'
+    ]
+    no_change = [
+        item for item in classification
+        if item.get('clasificacion') == 'SIN_CAMBIO_APLICABLE'
+    ]
+    pending = [
+        item for item in classification
+        if item.get('clasificacion') == 'PENDIENTE'
+    ]
+
+    print()
+    print('Resumen de clasificación:')
+    print('  Pendientes       :', len(pending))
+    print('  Ya migrados      :', len(already_migrated))
+    print('  Sin cambio aplica:', len(no_change))
+
+    # --limit se aplica SOLO sobre los pendientes.
     if args.limit:
-        groups = groups[:args.limit]
+        pending = pending[:args.limit]
+
+    groups = pending
+
     save(out / 'plan.json', groups)
+    save(
+        out / 'omitidos.json',
+        {
+            'already_migrated': already_migrated,
+            'sin_cambio_aplicable': no_change
+        }
+    )
+
+    print(
+        'Mosaicos seleccionados para esta ejecución:',
+        len(groups),
+        flush=True
+    )
+
     results = []
     for index, group in enumerate(groups, 1):
         print(f"[{index}/{len(groups)}] {group['mosaico']}", flush=True)
@@ -260,9 +419,43 @@ def main():
             break
     with (out / 'resumen.csv').open('w', newline='', encoding='utf-8-sig') as file:
         writer = csv.writer(file)
-        writer.writerow(['mosaico', 'servicios', 'estado', 'rutas_a_cambiar', 'error'])
+        writer.writerow([
+            'mosaico',
+            'servicios',
+            'estado',
+            'rutas_old_root',
+            'rutas_new_root',
+            'rutas_a_cambiar',
+            'error'
+        ])
+
+        by_mosaic = {
+            item['mosaico'].casefold(): item
+            for item in classification
+        }
+
         for r in results:
-            writer.writerow([r['mosaico'], ';'.join(r['servicios']), r['estado'], len(r.get('cambios', [])), r.get('error', '')])
+            c = by_mosaic.get(r['mosaico'].casefold(), {})
+            writer.writerow([
+                r['mosaico'],
+                ';'.join(r['servicios']),
+                r['estado'],
+                c.get('rutas_old_root', ''),
+                c.get('rutas_new_root', ''),
+                len(r.get('cambios', [])),
+                r.get('error', '')
+            ])
+
+        for item in already_migrated + no_change:
+            writer.writerow([
+                item['mosaico'],
+                ';'.join(item['servicios']),
+                item['clasificacion'],
+                item.get('rutas_old_root', ''),
+                item.get('rutas_new_root', ''),
+                0,
+                ''
+            ])
     print('Resultados:', out.resolve())
     print('El estado STARTED no certifica el despliegue. Validar imágenes y overviews a varias escalas.')
 

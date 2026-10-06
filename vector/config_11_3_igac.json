@@ -1,0 +1,16 @@
+{
+    "admin_url": "https://mapas2.igac.gov.co/host/admin",
+    "rest_url": "https://mapas2.igac.gov.co/host/rest/services",
+    "arcgisinput_root": "\\\\172.26.0.20\\cemconfig\\arcgisserver2\\directories\\arcgissystem\\arcgisinput",
+    "configstore_services_root": "\\\\172.26.0.20\\cemconfig\\arcgisserver2\\config-store\\services",
+    "old_root": "\\\\172.26.0.20\\cemdatos",
+    "new_root": "\\\\repositorio\\ArcGIS\\cemdatos",
+    "output_root": "D:\\Consultoria\\IGAC\\scripts_migrate_paths\\arcgis-service-path-repair\\vector",
+    "verify_ssl": true,
+    "http_timeout_seconds": 60,
+    "stop_timeout_seconds": 180,
+    "start_timeout_seconds": 300,
+    "delay_between_services_seconds": 1,
+    "include_regex": ".*",
+    "exclude_regex": "(^|[\\\\/])Hosted([\\\\/]|$)"
+}

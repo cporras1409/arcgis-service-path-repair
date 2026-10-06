@@ -1,7 +1,7 @@
 {
     "admin_url": "https://spwebgis113.esri.co/server/admin",
     "rest_url": "https://spwebgis113.esri.co/server/rest/services",
-    "arcgisinput_root": "\\\\11326server\\arcgissite\\directories\\arcgissystem\\arcgisinput",
+    "arcgisinput_root": "\\\\172.26.0.20\\cemconfig\\arcgisserver2\\directories\\arcgissystem\\arcgisinput",
     "configstore_services_root": "\\\\11326server\\arcgissite\\config-store\\services",
     "old_root": "\\\\11326webgis\\ArcGIS\\cemdatos",
     "new_root": "\\\\11326server\\ArcGIS\\cemdatos",
@@ -14,3 +14,4 @@
     "include_regex": ".*",
     "exclude_regex": "(^|[\\\\/])Hosted([\\\\/]|$)"
 }
+

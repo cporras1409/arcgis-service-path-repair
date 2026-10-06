@@ -17,6 +17,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 import requests
+import arcpy
 
 # 1. Constantes
 
@@ -202,6 +203,18 @@ class ArcGISAdmin:
 
     def service_status(self, service_path):
         return self.get(f"services/{service_path}/status")
+
+    def list_services(self, folder=""):
+        path = "services" if not folder else f"services/{folder}"
+        result = self.get(path)
+        return result.get("services") or []
+
+    def list_folders(self):
+        result = self.get("services")
+        return result.get("folders") or []
+
+    def service_manifest(self, service_path):
+        return self.get(f"services/{service_path}/iteminfo/manifest/manifest.json")
 
     def service_operation(self, service_path, operation):
         result = self.post(f"services/{service_path}/{operation}")
@@ -428,6 +441,11 @@ def classify_manifest(manifest, old_root):
                 "onServerConnectionString": server_conn,
                 "onPremiseConnectionString": premise_conn,
                 "onServerName": db.get("onServerName"),
+                "datasets": [
+                    dataset.get("onServerName")
+                    for dataset in (db.get("datasets") or [])
+                    if dataset.get("onServerName")
+                ],
             }
         )
     if not workspaces:
@@ -437,23 +455,131 @@ def classify_manifest(manifest, old_root):
     return ("FILEGDB_COPIED_OR_MIXED", workspaces)
 
 
-def discover_services(cfg):
+def rest_service_identity(folder, item, cfg):
+    service_name = (
+        item.get("serviceName")
+        or item.get("servicename")
+        or item.get("name")
+    )
+    service_type = item.get("type")
+    if not service_name or service_type not in ("MapServer", "FeatureServer"):
+        return None
+    folder = folder.strip("/")
+    prefix = folder + "/" if folder else ""
+    relative = (
+        Path(folder) / f"{service_name}.{service_type}"
+        if folder
+        else Path(f"{service_name}.{service_type}")
+    )
+    return {
+        "folder": folder,
+        "service_name": service_name,
+        "service_type": service_type,
+        "admin_path": f"{prefix}{service_name}.{service_type}",
+        "rest_path": f"{prefix}{service_name}/{service_type}",
+        "relative_service_dir": str(relative),
+        "arcgisinput_dir": str(Path(cfg["arcgisinput_root"]) / relative),
+        "configstore_dir": str(Path(cfg["configstore_services_root"]) / relative),
+        "manifest_path": "ArcGIS Server Admin REST",
+    }
+
+
+def discover_services_from_admin(admin, cfg):
+    old_root = cfg["old_root"]
+    include_regex = re.compile(cfg.get("include_regex", ".*"), flags=re.IGNORECASE)
+    exclude_regex = re.compile(
+        cfg.get("exclude_regex", r"(^|[\\/])Hosted([\\/]|$)"),
+        flags=re.IGNORECASE,
+    )
+    folders = [""] + [
+        folder for folder in admin.list_folders()
+        if folder.lower() not in ("system", "utilities")
+    ]
+    services = []
+
+    for folder in folders:
+        if folder and exclude_regex.search(folder):
+            continue
+        try:
+            items = admin.list_services(folder)
+        except Exception as exc:
+            services.append(
+                {
+                    "folder": folder,
+                    "service_name": "",
+                    "service_type": "",
+                    "admin_path": folder,
+                    "rest_path": folder,
+                    "relative_service_dir": folder,
+                    "arcgisinput_dir": "",
+                    "configstore_dir": "",
+                    "manifest_path": "ArcGIS Server Admin REST",
+                    "classification": "SERVICE_LIST_ERROR",
+                    "workspaces": [{"error": str(exc)}],
+                    "manifest_old_root_occurrences": 0,
+                }
+            )
+            continue
+
+        for item in items:
+            identity = rest_service_identity(folder, item, cfg)
+            if not identity:
+                continue
+            if not include_regex.search(identity["admin_path"]):
+                continue
+            if exclude_regex.search(identity["admin_path"]):
+                continue
+
+            try:
+                manifest = admin.service_manifest(identity["admin_path"])
+                classification, workspaces = classify_manifest(manifest, old_root)
+                old_count = recursive_count(manifest, old_root)
+            except Exception as exc:
+                classification = "MANIFEST_ERROR"
+                workspaces = [{"error": str(exc)}]
+                old_count = 0
+
+            services.append(
+                {
+                    **identity,
+                    "classification": classification,
+                    "workspaces": workspaces,
+                    "manifest_old_root_occurrences": old_count,
+                }
+            )
+
+    return services
+
+
+def discover_services_from_filesystem(cfg):
     arcgisinput_root = Path(cfg["arcgisinput_root"])
     configstore_root = Path(cfg["configstore_services_root"])
     old_root = cfg["old_root"]
+    include_regex = re.compile(cfg.get("include_regex", ".*"), flags=re.IGNORECASE)
     exclude_regex = re.compile(
-        cfg.get("exclude_regex", "(^|[\\\\/])Hosted([\\\\/]|$)"), flags=re.IGNORECASE
+        cfg.get("exclude_regex", r"(^|[\\/])Hosted([\\/]|$)"),
+        flags=re.IGNORECASE,
     )
     services = []
+
     for root, dirs, files in os.walk(arcgisinput_root):
         root_path = Path(root)
-        dirs[:] = [d for d in dirs if not exclude_regex.search(str(root_path / d))]
+        dirs[:] = [
+            d for d in dirs
+            if not exclude_regex.search(str(root_path / d))
+        ]
         if not is_vector_service_dir(root_path):
             continue
+
         identity = service_identity(root_path, arcgisinput_root)
+
         if exclude_regex.search(identity["admin_path"]):
             dirs[:] = []
             continue
+        if not include_regex.search(identity["admin_path"]):
+            dirs[:] = []
+            continue
+
         manifest_path = find_manifest_json(root_path)
         if not manifest_path:
             services.append(
@@ -461,31 +587,52 @@ def discover_services(cfg):
                     **identity,
                     "classification": "NO_MANIFEST",
                     "arcgisinput_dir": str(root_path),
-                    "configstore_dir": str(configstore_root / identity["relative_service_dir"]),
+                    "configstore_dir": str(
+                        configstore_root / identity["relative_service_dir"]
+                    ),
                     "manifest_path": "",
                     "workspaces": [],
+                    "manifest_old_root_occurrences": 0,
                 }
             )
             dirs[:] = []
             continue
+
+        manifest = None
         try:
             manifest = load_json(manifest_path)
             classification, workspaces = classify_manifest(manifest, old_root)
         except Exception as exc:
             classification = "MANIFEST_ERROR"
             workspaces = [{"error": str(exc)}]
+
         services.append(
             {
                 **identity,
                 "classification": classification,
                 "arcgisinput_dir": str(root_path),
-                "configstore_dir": str(configstore_root / identity["relative_service_dir"]),
+                "configstore_dir": str(
+                    configstore_root / identity["relative_service_dir"]
+                ),
                 "manifest_path": str(manifest_path),
                 "workspaces": workspaces,
+                "manifest_old_root_occurrences": (
+                    recursive_count(manifest, old_root)
+                    if manifest is not None
+                    else 0
+                ),
             }
         )
         dirs[:] = []
+
     return services
+
+
+def discover_services(admin, cfg):
+    mode = str(cfg.get("discovery_mode", "admin_rest")).lower()
+    if mode in ("filesystem", "file_system", "files"):
+        return discover_services_from_filesystem(cfg)
+    return discover_services_from_admin(admin, cfg)
 
 
 # 7. Escaneo de artefactos
@@ -594,6 +741,201 @@ def scan_service(service, old_root):
     return (rows, total)
 
 
+def scan_service_files(service, old_root):
+    rows = []
+    total = 0
+    for path in candidate_files(service):
+        name = path.name.lower()
+        if name.endswith(".msd"):
+            entries, count = scan_msd(path, old_root)
+            if count:
+                rows.append(
+                    {
+                        "file": str(path),
+                        "kind": "MSD",
+                        "occurrences": count,
+                        "entries": entries,
+                    }
+                )
+                total += count
+            continue
+
+        if name.endswith(".json") or name.endswith(".mapx"):
+            count = count_json_file(path, old_root)
+        else:
+            content, _ = read_text(path)
+            count = len(
+                re.findall(
+                    re.escape(old_root),
+                    content,
+                    flags=re.IGNORECASE,
+                )
+            )
+
+        if count:
+            rows.append(
+                {
+                    "file": str(path),
+                    "kind": (
+                        "JSON"
+                        if name.endswith(".json") or name.endswith(".mapx")
+                        else "XML/TEXT"
+                    ),
+                    "occurrences": count,
+                }
+            )
+            total += count
+    return (rows, total)
+
+
+def configstore_manifest_json(service):
+    return (
+        Path(service["configstore_dir"])
+        / "esriinfo"
+        / "manifest"
+        / "manifest.json"
+    )
+
+
+def wait_manifest_writable(service, timeout_seconds=60, stable_seconds=3):
+    """
+    Espera a que el manifest del config-store esté estable y pueda abrirse
+    en modo lectura/escritura.
+
+    No depende de que manifest.json.lock desaparezca, porque ArcGIS Server
+    puede mantener ese archivo .lock aun cuando manifest.json ya sea editable.
+    """
+    manifest = configstore_manifest_json(service)
+    deadline = time.time() + timeout_seconds
+    stable_since = None
+    last_signature = None
+    last_error = None
+
+    while time.time() < deadline:
+        if not manifest.exists():
+            last_error = "manifest.json no existe"
+            stable_since = None
+            time.sleep(1)
+            continue
+
+        try:
+            stat = manifest.stat()
+            signature = (stat.st_size, stat.st_mtime_ns)
+
+            with open(manifest, "r+b") as handle:
+                handle.seek(0, os.SEEK_END)
+
+            if signature == last_signature:
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= stable_seconds:
+                    return {
+                        "path": str(manifest),
+                        "writable": True,
+                        "stable_seconds": stable_seconds,
+                        "lock_file_exists": manifest.with_name(
+                            manifest.name + ".lock"
+                        ).exists(),
+                    }
+            else:
+                stable_since = time.time()
+                last_signature = signature
+
+            last_error = None
+
+        except (OSError, PermissionError) as exc:
+            last_error = str(exc)
+            stable_since = None
+
+        time.sleep(1)
+
+    raise RuntimeError(
+        "manifest.json del config-store no quedó estable/escribible "
+        f"en {timeout_seconds}s: {manifest}"
+        + (f" | último error: {last_error}" if last_error else "")
+    )
+
+
+def verify_manifest_paths(path, old_root, new_root):
+    old_count = count_json_file(path, old_root)
+    new_count = count_json_file(path, new_root)
+    return {
+        "file": str(path),
+        "old_root_occurrences": old_count,
+        "new_root_occurrences": new_count,
+    }
+
+
+def apply_service_files_except_manifest(
+    service,
+    old_root,
+    new_root,
+    work_root,
+):
+    primary_manifest = configstore_manifest_json(service)
+    rows = []
+    total = 0
+
+    for path in candidate_files(service):
+        try:
+            if path.resolve() == primary_manifest.resolve():
+                continue
+        except Exception:
+            if str(path).lower() == str(primary_manifest).lower():
+                continue
+
+        name = path.name.lower()
+
+        if name.endswith(".msd"):
+            count, entries = update_msd(
+                path,
+                old_root,
+                new_root,
+                work_root,
+            )
+            if count:
+                rows.append(
+                    {
+                        "file": str(path),
+                        "kind": "MSD",
+                        "replacements": count,
+                        "entries": entries,
+                    }
+                )
+                total += count
+            continue
+
+        if name.endswith(".json") or name.endswith(".mapx"):
+            count = update_json_file(
+                path,
+                old_root,
+                new_root,
+            )
+        else:
+            count = update_text_file(
+                path,
+                old_root,
+                new_root,
+            )
+
+        if count:
+            rows.append(
+                {
+                    "file": str(path),
+                    "kind": (
+                        "JSON"
+                        if name.endswith(".json")
+                        or name.endswith(".mapx")
+                        else "XML/TEXT"
+                    ),
+                    "replacements": count,
+                }
+            )
+            total += count
+
+    return (rows, total)
+
+
 # 8. Actualización de artefactos
 
 
@@ -627,8 +969,7 @@ def update_msd(path, old_root, new_root, work_root=None):
     path = Path(path)
     if not zipfile.is_zipfile(path):
         raise RuntimeError(f"MSD inválido: {path}")
-    # El temporal se crea junto al MSD para permitir el reemplazo atómico
-    # en la misma unidad o recurso UNC.
+
     temp = path.with_name(path.name + ".igac_tmp")
     total = 0
     changes = []
@@ -791,84 +1132,640 @@ def validate_rest_service(admin, service):
     return (result["query_ok"], result)
 
 
+def validate_rest_service_retry(
+    admin,
+    service,
+    timeout_seconds=120,
+    interval_seconds=5,
+):
+    """
+    Reintenta la validación REST posterior al START.
+
+    ArcGIS Server puede reportar STARTED/STARTED antes de que las capas
+    del MapServer hayan terminado de inicializarse. Esta función evita
+    hacer rollback por una validación demasiado temprana.
+    """
+    deadline = time.time() + timeout_seconds
+    attempts = []
+    last_result = None
+
+    while time.time() < deadline:
+        try:
+            ok, result = validate_rest_service(admin, service)
+        except Exception as exc:
+            ok = False
+            result = {
+                "root_ok": False,
+                "query_ok": False,
+                "layer_id": None,
+                "detail": [str(exc)],
+            }
+
+        attempts.append(
+            {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "ok": ok,
+                "result": result,
+            }
+        )
+
+        if ok:
+            return True, result, attempts
+
+        last_result = result
+        time.sleep(interval_seconds)
+
+    return False, last_result, attempts
+
+
+def validate_destination_source(service, cfg):
+    """
+    Valida antes del STOP que las FileGDB destino realmente existan y
+    puedan abrirse con ArcPy.
+
+    La validación comprueba:
+      - que se pueda construir la ruta esperada en NEW_ROOT;
+      - existencia a nivel del sistema operativo;
+      - arcpy.Exists sobre la FileGDB;
+      - presencia de los datasets declarados en el manifest, cuando existan.
+
+    No modifica el servicio.
+    """
+    old_root = cfg["old_root"]
+    new_root = cfg["new_root"]
+
+    report = {
+        "ok": True,
+        "relations": [],
+    }
+
+    for workspace in service.get("workspaces", []):
+        connection = (
+            workspace.get("onServerConnectionString")
+            or workspace.get("onPremiseConnectionString")
+            or ""
+        )
+        database = database_from_connection(connection)
+
+        if not database:
+            continue
+
+        expected_database = replace_root(
+            database,
+            old_root,
+            new_root,
+        )
+
+        relation = {
+            "source_database": database,
+            "expected_database": expected_database,
+            "os_exists": False,
+            "arcpy_exists": False,
+            "datasets": [],
+            "ok": False,
+        }
+
+        if not expected_database:
+            relation["error"] = (
+                "No fue posible construir la ruta destino "
+                "a partir de OLD_ROOT/NEW_ROOT"
+            )
+            report["relations"].append(relation)
+            report["ok"] = False
+            continue
+
+        try:
+            relation["os_exists"] = os.path.exists(
+                expected_database
+            )
+        except Exception as exc:
+            relation["os_error"] = str(exc)
+
+        try:
+            relation["arcpy_exists"] = bool(
+                arcpy.Exists(expected_database)
+            )
+        except Exception as exc:
+            relation["arcpy_error"] = str(exc)
+
+        if not relation["arcpy_exists"]:
+            relation["error"] = (
+                "La FileGDB destino no existe o no puede "
+                "ser abierta por ArcPy"
+            )
+            report["relations"].append(relation)
+            report["ok"] = False
+            continue
+
+        dataset_names = [
+            name
+            for name in (workspace.get("datasets") or [])
+            if name
+        ]
+
+        discovered = {}
+        try:
+            for dirpath, dirnames, filenames in arcpy.da.Walk(
+                expected_database,
+                datatype=[
+                    "FeatureClass",
+                    "Table",
+                ],
+            ):
+                for filename in filenames:
+                    discovered.setdefault(
+                        str(filename).lower(),
+                        str(Path(dirpath) / filename),
+                    )
+        except Exception as exc:
+            relation["walk_error"] = str(exc)
+
+        for dataset_name in dataset_names:
+            dataset_key = str(dataset_name).lower()
+            candidate = discovered.get(dataset_key)
+
+            if not candidate:
+                root_candidate = str(
+                    Path(expected_database) / dataset_name
+                )
+                try:
+                    if arcpy.Exists(root_candidate):
+                        candidate = root_candidate
+                except Exception:
+                    pass
+
+            dataset_info = {
+                "name": dataset_name,
+                "path": candidate,
+                "exists": bool(candidate),
+            }
+
+            if candidate:
+                try:
+                    dataset_info["arcpy_exists"] = bool(
+                        arcpy.Exists(candidate)
+                    )
+                except Exception as exc:
+                    dataset_info["arcpy_exists"] = False
+                    dataset_info["error"] = str(exc)
+
+                if dataset_info.get("arcpy_exists"):
+                    try:
+                        dataset_info["count"] = int(
+                            arcpy.management.GetCount(
+                                candidate
+                            )[0]
+                        )
+                    except Exception as exc:
+                        dataset_info["count_error"] = str(exc)
+            else:
+                dataset_info["arcpy_exists"] = False
+
+            relation["datasets"].append(dataset_info)
+
+        datasets_ok = all(
+            item.get("arcpy_exists", False)
+            for item in relation["datasets"]
+        ) if relation["datasets"] else True
+
+        relation["ok"] = bool(
+            relation["arcpy_exists"]
+            and datasets_ok
+        )
+
+        if not relation["ok"]:
+            relation["error"] = (
+                "Uno o más datasets requeridos por el servicio "
+                "no están disponibles en la FileGDB destino"
+            )
+
+        report["relations"].append(relation)
+
+        if not relation["ok"]:
+            report["ok"] = False
+
+    if not report["relations"]:
+        report["ok"] = False
+        report["error"] = (
+            "No se encontraron workspaces FileGDB para validar"
+        )
+
+    return report
+
+
 # 11. Procesamiento de servicios
 
 
 def process_service(admin, cfg, service, run_dir):
     old_root = cfg["old_root"]
     new_root = cfg["new_root"]
-    result = {"service": service["admin_path"], "result": "", "error": ""}
-    baseline_ok, baseline_rest = validate_rest_service(admin, service)
+    result = {
+        "service": service["admin_path"],
+        "result": "",
+        "error": "",
+    }
+
+    baseline_ok, baseline_rest = validate_rest_service(
+        admin,
+        service,
+    )
     if not baseline_ok:
         result["result"] = "SKIPPED_BASELINE_REST_FAILED"
-        result["error"] = json.dumps(baseline_rest, ensure_ascii=False)
+        result["error"] = json.dumps(
+            baseline_rest,
+            ensure_ascii=False,
+        )
         evidence = {
             "service": service,
             "baseline_rest": baseline_rest,
             "datastore_status": service.get("datastore_status"),
         }
         return (result, evidence)
-    before_files, before_hits = scan_service(service, old_root)
+
+    before_files, before_hits = scan_service(
+        service,
+        old_root,
+    )
     if before_hits == 0:
         result["result"] = "NO_OLD_ROOT_FOUND"
         return (result, {})
-    backup = backup_service(service, Path(run_dir) / "backups")
-    evidence = {"before_files": before_files, "baseline_rest": baseline_rest, "backup": str(backup)}
+
+    print("VALIDANDO FUENTE DESTINO:", service["admin_path"])
+    destination_source = validate_destination_source(
+        service,
+        cfg,
+    )
+
+    for relation in destination_source.get("relations", []):
+        print("  GDB:", relation.get("expected_database"))
+        print(
+            "    OS:",
+            relation.get("os_exists"),
+            "| ArcPy:",
+            relation.get("arcpy_exists"),
+        )
+
+        for dataset in relation.get("datasets", []):
+            detail = (
+                "    Dataset: "
+                + str(dataset.get("name"))
+                + " | ArcPy: "
+                + str(dataset.get("arcpy_exists"))
+            )
+            if "count" in dataset:
+                detail += " | Count: " + str(dataset["count"])
+            print(detail)
+
+    if not destination_source.get("ok"):
+        result["result"] = "SKIPPED_DESTINATION_SOURCE_INVALID"
+        result["error"] = (
+            "La fuente de datos destino no existe, no es "
+            "accesible o no contiene los datasets requeridos"
+        )
+        evidence = {
+            "service": service,
+            "before_files": before_files,
+            "baseline_rest": baseline_rest,
+            "destination_source_validation": destination_source,
+            "datastore_status": service.get("datastore_status"),
+        }
+        print(
+            "  [BLOQUEADO] No se modificará el servicio."
+        )
+        return (result, evidence)
+
+    print("  [OK] Fuente destino validada")
+
+    backup = backup_service(
+        service,
+        Path(run_dir) / "backups",
+    )
+    evidence = {
+        "before_files": before_files,
+        "baseline_rest": baseline_rest,
+        "destination_source_validation": destination_source,
+        "backup": str(backup),
+    }
+
+    service_started_after_change = False
+
     try:
         print("\nSTOP:", service["admin_path"])
-        evidence["stop_response"] = admin.service_operation(service["admin_path"], "stop")
-        stopped, stop_status = admin.wait_state(
-            service["admin_path"], "STOPPED", int(cfg.get("stop_timeout_seconds", 180))
+        evidence["stop_response"] = admin.service_operation(
+            service["admin_path"],
+            "stop",
         )
+
+        stopped, stop_status = admin.wait_state(
+            service["admin_path"],
+            "STOPPED",
+            int(cfg.get("stop_timeout_seconds", 180)),
+        )
+        evidence["stop_status"] = stop_status
+
         if not stopped:
-            raise RuntimeError("Servicio no alcanzó STOPPED/STOPPED")
-        changes, replacements = apply_service_files(
+            raise RuntimeError(
+                "Servicio no alcanzó STOPPED/STOPPED"
+            )
+
+        # En IGAC se observó que STOPPED/STOPPED puede ocurrir antes de
+        # que manifest.json quede realmente estable para escritura.
+        manifest_ready = wait_manifest_writable(
+            service,
+            timeout_seconds=int(
+                cfg.get("manifest_wait_timeout_seconds", 60)
+            ),
+            stable_seconds=int(
+                cfg.get("manifest_stable_seconds", 3)
+            ),
+        )
+        evidence["manifest_ready_before_change"] = manifest_ready
+
+        # Primero modificar todos los artefactos excepto el manifest.json
+        # principal del config-store.
+        changes, replacements = apply_service_files_except_manifest(
             service,
             old_root,
             new_root,
-            Path(run_dir) / "work" / service["admin_path"].replace("/", "__"),
+            Path(run_dir)
+            / "work"
+            / service["admin_path"].replace("/", "__"),
         )
         evidence["changes"] = changes
         result["replacements"] = replacements
-        if replacements == 0:
-            raise RuntimeError("No se realizaron reemplazos")
-        _, old_after = scan_service(service, old_root)
-        if old_after != 0:
-            raise RuntimeError(f"Persisten {old_after} referencias OLD_ROOT")
-        print("START:", service["admin_path"])
-        evidence["start_response"] = admin.service_operation(service["admin_path"], "start")
-        started, start_status = admin.wait_state(
-            service["admin_path"], "STARTED", int(cfg.get("start_timeout_seconds", 300))
+
+        # El manifest principal se modifica al final, una vez estabilizado.
+        primary_manifest = configstore_manifest_json(service)
+        if not primary_manifest.exists():
+            raise RuntimeError(
+                "No existe manifest.json principal del config-store: "
+                + str(primary_manifest)
+            )
+
+        manifest_replacements = update_json_file(
+            primary_manifest,
+            old_root,
+            new_root,
         )
+        result["replacements"] += manifest_replacements
+        evidence["configstore_manifest_change"] = {
+            "file": str(primary_manifest),
+            "replacements": manifest_replacements,
+        }
+
+        if result["replacements"] == 0:
+            raise RuntimeError(
+                "No se realizaron reemplazos"
+            )
+
+        # Validación inmediata del manifest editado.
+        manifest_check = verify_manifest_paths(
+            primary_manifest,
+            old_root,
+            new_root,
+        )
+        evidence["configstore_manifest_check_immediate"] = (
+            manifest_check
+        )
+
+        if manifest_check["old_root_occurrences"] != 0:
+            raise RuntimeError(
+                "El manifest.json principal conserva "
+                f"{manifest_check['old_root_occurrences']} "
+                "referencias OLD_ROOT inmediatamente después "
+                "de escribirlo"
+            )
+
+        if manifest_check["new_root_occurrences"] == 0:
+            raise RuntimeError(
+                "El manifest.json principal no contiene NEW_ROOT "
+                "después de la actualización"
+            )
+
+        # Esperar unos segundos y verificar de nuevo para detectar
+        # regeneración/reversión antes de arrancar el servicio.
+        time.sleep(
+            int(cfg.get("manifest_post_write_verify_seconds", 5))
+        )
+
+        manifest_check_delayed = verify_manifest_paths(
+            primary_manifest,
+            old_root,
+            new_root,
+        )
+        evidence["configstore_manifest_check_delayed"] = (
+            manifest_check_delayed
+        )
+
+        if manifest_check_delayed["old_root_occurrences"] != 0:
+            raise RuntimeError(
+                "ArcGIS Server revirtió/regeneró manifest.json: "
+                f"{manifest_check_delayed['old_root_occurrences']} "
+                "referencias OLD_ROOT reaparecieron antes del START"
+            )
+
+        # Validar todos los artefactos físicos.
+        physical_after_files, physical_after = scan_service_files(
+            service,
+            old_root,
+        )
+        evidence["physical_after"] = physical_after_files
+
+        if physical_after:
+            detail = "; ".join(
+                f"{row['file']} ({row['occurrences']})"
+                for row in physical_after_files
+            )
+            raise RuntimeError(
+                "Persisten "
+                f"{physical_after} referencias OLD_ROOT "
+                f"en archivos físicos: {detail}"
+            )
+
+        print("START:", service["admin_path"])
+        evidence["start_response"] = admin.service_operation(
+            service["admin_path"],
+            "start",
+        )
+        service_started_after_change = True
+
+        started, start_status = admin.wait_state(
+            service["admin_path"],
+            "STARTED",
+            int(cfg.get("start_timeout_seconds", 300)),
+        )
+        evidence["start_status"] = start_status
+
         if not started:
-            raise RuntimeError("Servicio no alcanzó STARTED/STARTED")
-        rest_ok, rest_after = validate_rest_service(admin, service)
+            raise RuntimeError(
+                "Servicio no alcanzó STARTED/STARTED"
+            )
+
+        # Validación del manifest vivo que ArcGIS Server expone.
+        live_manifest = admin.service_manifest(
+            service["admin_path"]
+        )
+        live_manifest_old = recursive_count(
+            live_manifest,
+            old_root,
+        )
+        live_manifest_new = recursive_count(
+            live_manifest,
+            new_root,
+        )
+
+        evidence["admin_manifest_after"] = {
+            "old_root_occurrences": live_manifest_old,
+            "new_root_occurrences": live_manifest_new,
+            "manifest": live_manifest,
+        }
+
+        if live_manifest_old:
+            raise RuntimeError(
+                "Persisten "
+                f"{live_manifest_old} referencias OLD_ROOT "
+                "en Admin REST manifest después del reinicio"
+            )
+
+        if live_manifest_new == 0:
+            raise RuntimeError(
+                "Admin REST manifest no refleja NEW_ROOT "
+                "después del reinicio"
+            )
+
+        rest_ok, rest_after, rest_attempts = validate_rest_service_retry(
+            admin,
+            service,
+            timeout_seconds=int(
+                cfg.get("rest_post_start_timeout_seconds", 120)
+            ),
+            interval_seconds=int(
+                cfg.get("rest_post_start_interval_seconds", 5)
+            ),
+        )
         evidence["rest_after"] = rest_after
+        evidence["rest_after_attempts"] = rest_attempts
+
         if not rest_ok:
-            raise RuntimeError("Validación REST posterior falló")
+            raise RuntimeError(
+                "Validación REST posterior falló después de reintentos"
+            )
+
         result["result"] = "SUCCESS"
         return (result, evidence)
+
     except Exception as exc:
         result["error"] = str(exc)
         print("ERROR -> ROLLBACK:", exc)
+
         try:
-            restore_service_backup(backup)
             try:
-                admin.service_operation(service["admin_path"], "start")
-            except Exception:
-                pass
-            started, _ = admin.wait_state(
-                service["admin_path"], "STARTED", int(cfg.get("start_timeout_seconds", 300))
+                current = admin.service_status(
+                    service["admin_path"]
+                )
+                configured = str(
+                    current.get("configuredState", "")
+                ).upper()
+                realtime = str(
+                    current.get("realTimeState", "")
+                ).upper()
+
+                if (
+                    configured != "STOPPED"
+                    or realtime != "STOPPED"
+                ):
+                    admin.service_operation(
+                        service["admin_path"],
+                        "stop",
+                    )
+                    rollback_stopped, rollback_stop_status = (
+                        admin.wait_state(
+                            service["admin_path"],
+                            "STOPPED",
+                            int(
+                                cfg.get(
+                                    "stop_timeout_seconds",
+                                    180,
+                                )
+                            ),
+                        )
+                    )
+                    evidence["rollback_stop_status"] = (
+                        rollback_stop_status
+                    )
+
+                    if not rollback_stopped:
+                        raise RuntimeError(
+                            "Rollback: servicio no alcanzó "
+                            "STOPPED/STOPPED"
+                        )
+            except Exception as stop_exc:
+                raise RuntimeError(
+                    "Rollback no pudo detener el servicio: "
+                    + str(stop_exc)
+                )
+
+            # Esperar que el manifest esté estable antes de restaurar.
+            try:
+                evidence["manifest_ready_before_rollback"] = (
+                    wait_manifest_writable(
+                        service,
+                        timeout_seconds=int(
+                            cfg.get(
+                                "manifest_wait_timeout_seconds",
+                                60,
+                            )
+                        ),
+                        stable_seconds=int(
+                            cfg.get(
+                                "manifest_stable_seconds",
+                                3,
+                            )
+                        ),
+                    )
+                )
+            except Exception as wait_exc:
+                evidence["manifest_wait_rollback_warning"] = (
+                    str(wait_exc)
+                )
+
+            restore_service_backup(backup)
+
+            admin.service_operation(
+                service["admin_path"],
+                "start",
             )
-            rest_ok, rollback_rest = validate_rest_service(admin, service)
-            evidence["rollback"] = {"started": started, "rest_ok": rest_ok, "rest": rollback_rest}
+            started, _ = admin.wait_state(
+                service["admin_path"],
+                "STARTED",
+                int(cfg.get("start_timeout_seconds", 300)),
+            )
+
+            rest_ok, rollback_rest = validate_rest_service(
+                admin,
+                service,
+            )
+            evidence["rollback"] = {
+                "started": started,
+                "rest_ok": rest_ok,
+                "rest": rollback_rest,
+            }
+
             if started and rest_ok:
                 result["result"] = "FAILED_ROLLBACK_OK"
             else:
-                result["result"] = "FAILED_ROLLBACK_ATTENTION_REQUIRED"
+                result["result"] = (
+                    "FAILED_ROLLBACK_ATTENTION_REQUIRED"
+                )
+
         except Exception as rollback_exc:
-            result["result"] = "FAILED_ROLLBACK_ATTENTION_REQUIRED"
-            result["error"] += " | Rollback: " + str(rollback_exc)
+            result["result"] = (
+                "FAILED_ROLLBACK_ATTENTION_REQUIRED"
+            )
+            result["error"] += (
+                " | Rollback: " + str(rollback_exc)
+            )
+
         return (result, evidence)
 
 
@@ -886,7 +1783,7 @@ def main():
     if not cfg.get("verify_ssl", True):
         requests.packages.urllib3.disable_warnings()
     print("=" * 90)
-    print("IGAC - MIGRADOR VECTORIAL ARCGIS SERVER 11.3 v1.2")
+    print("IGAC - MIGRADOR VECTORIAL ARCGIS SERVER 11.3 v1.8")
     print("=" * 90)
     print("Modo     :", args.mode.upper())
     print("OLD_ROOT :", cfg["old_root"])
@@ -906,7 +1803,7 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     datastore_rows = datastore_audit(admin, cfg)
     save_json(run_dir / "datastores_audit.json", datastore_rows)
-    services = discover_services(cfg)
+    services = discover_services(admin, cfg)
     if args.only_service:
         services = [
             service
