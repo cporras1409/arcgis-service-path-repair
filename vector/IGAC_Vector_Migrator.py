@@ -14,7 +14,7 @@ import sys
 import time
 import traceback
 import zipfile
-from datetime import datetime
+import datetime
 from pathlib import Path
 import requests
 import arcpy
@@ -29,7 +29,7 @@ FILEGDB_TOKEN = "FileGDBWorkspaceFactory"
 
 
 def stamp():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def load_json(path):
@@ -1086,7 +1086,7 @@ def backup_service(service, backup_root):
         {
             "service": service,
             "directories": mappings,
-            "created": datetime.now().isoformat(timespec="seconds"),
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
         },
     )
     return destination
@@ -1163,7 +1163,7 @@ def validate_rest_service_retry(
 
         attempts.append(
             {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
                 "ok": ok,
                 "result": result,
             }
