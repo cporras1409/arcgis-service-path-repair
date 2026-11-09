@@ -1,0 +1,22 @@
+{
+    "admin_url": "https://sigi.igac.gov.co/hosted/admin",
+    "rest_url": "https://sigi.igac.gov.co/hosted/rest/services",
+    "arcgisinput_root": "\\\\repositorio\\ArcGIS\\sigiconfig\\arcgisserver\\directories\\arcgissystem\\arcgisinput",
+    "configstore_services_root": "\\\\repositorio\\ArcGIS\\sigiconfig\\arcgisserver\\config-store\\services",
+    "old_root": "\\\\172.26.0.20\\cemdatos",
+    "new_root": "\\\\repositorio\\ArcGIS\\cemdatos",
+    "output_root": "C:\\Users\\soporteesri\\Documents\\migracion\\vector",
+    "verify_ssl": true,
+    "http_timeout_seconds": 180,
+    "stop_timeout_seconds": 180,
+    "start_timeout_seconds": 300,
+	"admin_manifest_refresh_timeout_seconds": 300,
+    "admin_manifest_refresh_interval_seconds": 5,
+    "delay_between_services_seconds": 1,
+	"post_stop_wait_seconds": 20,
+	"manifest_wait_timeout_seconds": 90,
+	"manifest_stable_seconds": 5,
+    "include_regex": ".*",
+    "exclude_regex": "(^|[\\\\/])Hosted([\\\\/]|$)",
+	"discovery_mode": "filesystem"
+}
